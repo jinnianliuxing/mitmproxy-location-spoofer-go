@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/elazarl/goproxy"
 )
@@ -29,10 +30,92 @@ var embeddedCAKeyPEM []byte
 //go:embed mitmproxy-ca-cert.cer
 var embeddedCACertCER []byte
 
+// writeFileForAllUsers 写入文件并确保所有用户可访问（避免管理员写入后普通进程无法读取）
+func writeFileForAllUsers(path string, data []byte) error {
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return err
+	}
+	// Windows 下修改 DACL，添加 Everyone 读取权限
+	modadvapi32, err := syscall.LoadDLL("advapi32.dll")
+	if err != nil {
+		return nil
+	}
+	procSetEntriesInAclW, err := modadvapi32.FindProc("SetEntriesInAclW")
+	if err != nil {
+		return nil
+	}
+	procSetNamedSecurityInfoW, err := modadvapi32.FindProc("SetNamedSecurityInfoW")
+	if err != nil {
+		return nil
+	}
+
+	pathPtr, _ := syscall.UTF16PtrFromString(path)
+
+	const (
+		SE_FILE_OBJECT              = 1
+		DACL_SECURITY_INFORMATION   = 4
+		GRANT_ACCESS                = 1
+		FILE_GENERIC_READ           = 0x80000000 | 0x40000000 | 0x20000000 | 0x10000000 | 0x08000000
+		TRUSTEE_IS_SID              = 2
+		TRUSTEE_IS_WELL_KNOWN_GROUP = 5
+	)
+
+	type TRUSTEE struct {
+		pMultipleTrustee *byte
+		MultipleTrustee  uint32
+		TrusteeForm      uint32
+		TrusteeType      uint32
+		ptstrName        *uint16
+	}
+	type EXPLICIT_ACCESS struct {
+		grfAccessPermissions uint32
+		grfAccessMode        uint32
+		grfInheritance       uint32
+		Trustee              TRUSTEE
+	}
+
+	everyoneSIDStr, _ := syscall.UTF16PtrFromString("S-1-1-0")
+	trustee := TRUSTEE{
+		TrusteeForm: TRUSTEE_IS_SID,
+		TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+		ptstrName:   everyoneSIDStr,
+	}
+	ea := EXPLICIT_ACCESS{
+		grfAccessPermissions: FILE_GENERIC_READ,
+		grfAccessMode:        GRANT_ACCESS,
+		grfInheritance:       0,
+		Trustee:              trustee,
+	}
+
+	var newAcl uintptr
+	ret, _, _ := procSetEntriesInAclW.Call(
+		1,
+		uintptr(unsafe.Pointer(&ea)),
+		0,
+		uintptr(unsafe.Pointer(&newAcl)),
+	)
+	if ret != 0 {
+		return nil
+	}
+	defer syscall.NewLazyDLL("advapi32.dll").NewProc("LocalFree").Call(newAcl)
+
+	procSetNamedSecurityInfoW.Call(
+		uintptr(unsafe.Pointer(pathPtr)),
+		SE_FILE_OBJECT,
+		DACL_SECURITY_INFORMATION,
+		0,
+		0,
+		newAcl,
+		0,
+	)
+	return nil
+}
+
 const (
-	proxyHost   = "127.0.0.1"
-	proxyPort   = 8888
-	targetQQMap = "apis.map.qq.com"
+	proxyHost    = "127.0.0.1"
+	proxyPort    = 8888
+	targetQQMap  = "apis.map.qq.com"
+	targetSimple = "simp.csuft.edu.cn"
 )
 
 var locations = map[int]Location{
@@ -68,7 +151,7 @@ func isTargetHost(host string) bool {
 	if i := strings.LastIndex(host, ":"); i > 0 {
 		hostOnly = host[:i]
 	}
-	return hostOnly == targetQQMap
+	return hostOnly == targetQQMap || hostOnly == targetSimple
 }
 
 func initEmbeddedCA() {
@@ -95,7 +178,7 @@ func runProxy() {
 	fmt.Println("[*] 启用系统代理...")
 	if !setProxy(true, fmt.Sprintf("%s:%d", proxyHost, proxyPort)) {
 		fmt.Println("[ERROR] 无法启用系统代理")
-		time.Sleep(2)
+		time.Sleep(2 * time.Second)
 		os.Exit(1)
 	}
 	fmt.Println("[OK] 系统代理已启用")
@@ -107,31 +190,45 @@ func runProxy() {
 	// ====== 构建 goproxy ======
 	ps := goproxy.NewProxyHttpServer()
 
-	// 仅对腾讯地图启用 HTTPS MITM
+	// 对腾讯地图和 simp.csuft.edu.cn 启用 HTTPS MITM
 	ps.OnRequest(hostMatchCond(targetQQMap)).HandleConnect(goproxy.AlwaysMitm)
+	ps.OnRequest(hostMatchCond(targetSimple)).HandleConnect(goproxy.AlwaysMitm)
 
-	// 请求日志 + 首次流量提示
+	// 请求日志 + dormSignTask API 监听提示
 	var reqCount int64
-	var trafficDetected bool
+	var dormSignDetected bool
 	ps.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 		reqCount++
-		if !trafficDetected && reqCount >= 1 {
-			trafficDetected = true
-			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-			fmt.Println("  ✅ 持续监听中 — 代理已成功拦截数据流量")
-			fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-		}
 		if isTargetHost(r.Host) || isTargetHost(r.URL.Host) {
 			host := r.URL.Host
 			if host == "" {
 				host = r.Host
 			}
-			fmt.Printf("[#%d] %s %s %s\n", reqCount, r.Method, host, r.URL.Path)
+			// 判断是否是 simple 目标主机
+			hostOnly := host
+			if i := strings.LastIndex(host, ":"); i > 0 {
+				hostOnly = host[:i]
+			}
+			
+			// 添加对 dormSignTask API 的日志输出 - 简洁格式
+			if strings.Contains(r.URL.Path, "/api/flySource-yxgl/dormSignTask/") {
+				if !dormSignDetected {
+					dormSignDetected = true
+					fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+					fmt.Println("  ✅ 持续监听中 — 代理已成功拦截数据流量")
+					fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+				}
+				fmt.Printf("[#%d] [DORMSIGN] %s %s\n", reqCount, r.Method, r.URL.Path)
+			} else if hostOnly == targetSimple {
+				fmt.Printf("[#%d] [simple] %s %s\n", reqCount, r.Method, r.URL.String())
+			} else {
+				fmt.Printf("[#%d] %s %s %s\n", reqCount, r.Method, host, r.URL.Path)
+			}
 		}
 		return r, nil
 	})
 
-	// 响应处理：定位伪造
+	// 响应处理：定位伪造 + simple API 日志
 	ps.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if resp == nil {
 			return resp
@@ -142,6 +239,17 @@ func runProxy() {
 		}
 
 		if isTargetHost(host) {
+			hostOnly := host
+			if i := strings.LastIndex(host, ":"); i > 0 {
+				hostOnly = host[:i]
+			}
+
+			// 如果是对 simple 主机的响应，打印简洁日志（仅状态码）
+			if hostOnly == targetSimple {
+				fmt.Printf("  <- %d\n", resp.StatusCode)
+				return resp
+			}
+
 			fmt.Printf("  <- %d\n", resp.StatusCode)
 
 			if strings.Contains(ctx.Req.URL.Path, "/ws/coord/v1/translate") {
@@ -176,7 +284,7 @@ func runProxy() {
 	if err != nil {
 		fmt.Printf("[ERROR] 端口 %d 被占用: %v\n", proxyPort, err)
 		cleanupProxy()
-		time.Sleep(2)
+		time.Sleep(2 * time.Second)
 		os.Exit(1)
 	}
 
@@ -188,7 +296,8 @@ func runProxy() {
 	fmt.Println()
 	fmt.Printf("[OK] 监听 %s:%d\n\n", proxyHost, proxyPort)
 
-	openWechatMiniprogram()
+	// 注意: 微信小程序由启动器(launcher)负责打开，代理内部不再自动调用
+	// openWechatMiniprogram()
 
 	server := &http.Server{Addr: addr, Handler: ps, IdleTimeout: 5 * time.Second}
 
@@ -208,11 +317,10 @@ func runProxy() {
 	if err != nil && err != http.ErrServerClosed {
 		fmt.Printf("[ERROR] 服务器错误: %v\n", err)
 	}
-	
+
 	// 确保最终清理
 	cleanupProxy()
 }
-
 
 // ====== CA 证书 ======
 
@@ -231,9 +339,9 @@ func installCertificateFromEmbedded() bool {
 	userMitmproxy := filepath.Join(homeDir, ".mitmproxy")
 	os.MkdirAll(userMitmproxy, 0755)
 	cerPath := filepath.Join(userMitmproxy, "mitmproxy-ca-cert.cer")
-	os.WriteFile(cerPath, embeddedCACertCER, 0644)
-	os.WriteFile(filepath.Join(userMitmproxy, "mitmproxy-ca-cert.pem"), embeddedCACertPEM, 0644)
-	os.WriteFile(filepath.Join(userMitmproxy, "mitmproxy-ca.pem"), embeddedCAKeyPEM, 0644)
+	writeFileForAllUsers(cerPath, embeddedCACertCER)
+	writeFileForAllUsers(filepath.Join(userMitmproxy, "mitmproxy-ca-cert.pem"), embeddedCACertPEM)
+	writeFileForAllUsers(filepath.Join(userMitmproxy, "mitmproxy-ca.pem"), embeddedCAKeyPEM)
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		cmd := createCommand("certutil", "-addstore", "-user", "Root", cerPath)

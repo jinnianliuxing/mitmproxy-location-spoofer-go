@@ -173,6 +173,18 @@ func checkCertificateInstalled() bool {
 	return strings.Contains(strings.ToLower(string(output)), "mitmproxy")
 }
 
+func showMessageBox(title, message string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+	const MB_OK = 0
+	syscall.NewLazyDLL("user32.dll").NewProc("MessageBoxW").Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		MB_OK,
+	)
+}
+
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
